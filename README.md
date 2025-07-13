@@ -7,8 +7,8 @@ We investigate the faithfulness of Chain-of-Thought(CoT) prompting by applying a
 
 This project builds on top of:
 
-- [`automated-interpretability`](https://github.com/openai/automated-interpretability) (by OpenAI)
-- [`sparse_coding`](https://github.com/HoagyC/sparse_coding) (by Cunningham et al.)
+- https://github.com/sekirodie1000/automated-interpretability (forked from OpenAI)
+- https://github.com/sekirodie1000/sparse_coding (forked from Cunningham et al.)
 
 We forked and slightly modified the above repositories to support our experiments.  
 The custom code is located in the `experiments/` directory.
@@ -27,7 +27,7 @@ We also made minor adjustments to the original SAE codebase to expose internal a
 
 ## Installation
 
-This project depends on a custom fork of [`sparse_coding`](https://github.com/sekirodie1000/sparse_coding).  
+This project depends on our custom forks of two repositories.  
 Please follow these steps before running any experiments:
 
 ```bash
@@ -36,4 +36,7 @@ git clone https://github.com/sekirodie1000/sparse_coding.git
 cd sparse_coding
 
 # 2. Install dependencies
+# This will also install neuron-explainer from the forked automated-interpretability repo
 pip install -r requirements.txt
+
+
