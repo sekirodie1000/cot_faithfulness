@@ -1,0 +1,1189 @@
+diff --git a/activation_dataset.py b/activation_dataset.py
+index 762e6a1..5cb3a50 100644
+--- a/activation_dataset.py
++++ b/activation_dataset.py
+@@ -9,9 +9,9 @@ import torch
+ import torch.nn as nn
+ 
+ from baukit import Trace
+-from datasets import Dataset, DatasetDict, load_dataset
++from datasets import Dataset, DatasetDict, load_dataset, DownloadConfig
+ from einops import rearrange
+-from torch.utils.data import DataLoader
++from torch.utils.data import DataLoader, default_collate
+ from tqdm import tqdm
+ from transformer_lens import HookedTransformer
+ from transformer_lens.loading_from_pretrained import get_official_model_name, convert_hf_model_config
+@@ -26,6 +26,26 @@ MODEL_BATCH_SIZE = 4
+ CHUNK_SIZE_GB = 2.0
+ MAX_SENTENCE_LEN = 256
+ 
++FEW_SHOT_COT = """\
++Q: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?
++A: How many clips did Natalia sell in May? ** Natalia sold 48/2 = <<48/2=24>>24 clips in May.
++How many clips did Natalia sell altogether in April and May? ** Natalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.
++#### 72
++
++Q: Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?
++A: How much does Weng earn per minute? ** Weng earns 12/60 = $<<12/60=0.2>>0.2 per minute.
++How much did Weng earn? ** Working 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10.
++#### 10
++
++Q: Betty is saving money for a new wallet which costs $100. Betty has only half of the money she needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much as her parents. How much more money does Betty need to buy the wallet?
++A: How much money does Betty have in the beginning? ** In the beginning, Betty has only 100 / 2 = $<<100/2=50>>50.
++How much money did Betty's grandparents give her? ** Betty's grandparents gave her 15 * 2 = $<<15*2=30>>30.
++How much more money does Betty need to buy the wallet? ** This means, Betty needs 100 - 50 - 30 - 15 = $<<100-50-30-15=5>>5 more.
++#### 5
++
++"""
++
++
+ 
+ def check_use_baukit(model_name):
+     if model_name in ["nanoGPT"]:
+@@ -37,7 +57,10 @@ def check_use_baukit(model_name):
+ 
+ 
+ def get_activation_size(model_name: str, layer_loc: str):
+-    assert check_transformerlens_model(model_name) or model_name == "nanoGPT", f"Model {model_name} not supported"
++    # assert check_transformerlens_model(model_name) or model_name == "nanoGPT", f"Model {model_name} not supported"
++    if not (check_transformerlens_model(model_name) or model_name == "nanoGPT"):
++        print(f"[INFO] Assuming HuggingFace model: {model_name}")
++
+     assert layer_loc in [
+         "residual",
+         "mlp",
+@@ -58,12 +81,22 @@ def get_activation_size(model_name: str, layer_loc: str):
+         return model_cfg["d_head"] * model_cfg["n_heads"]
+ 
+ 
++# def check_transformerlens_model(model_name: str):
++#     try:
++#         get_official_model_name(model_name)
++#         return True
++#     except ValueError:
++#         return False
++
+ def check_transformerlens_model(model_name: str):
+     try:
+         get_official_model_name(model_name)
+         return True
+     except ValueError:
+         return False
++    except Exception:
++        return False
++
+ 
+ 
+ def make_tensor_name(layer: int, layer_loc: str, model_name: str) -> str:
+@@ -75,33 +108,44 @@ def make_tensor_name(layer: int, layer_loc: str, model_name: str) -> str:
+         "attn_concat",
+         "mlpout",
+     ], f"Layer location {layer_loc} not supported"
+-    if layer_loc == "residual":
+-        if check_transformerlens_model(model_name):
+-            tensor_name = f"blocks.{layer}.hook_resid_post"
+-        else:
+-            raise NotImplementedError(f"Model {model_name} not supported for residual stream")
+-    elif layer_loc == "attn_concat":
+-        if check_transformerlens_model(model_name):
+-            tensor_name = f"blocks.{layer}.attn.hook_z"
+-        else:
+-            raise NotImplementedError(f"Model {model_name} not supported for attention output")
+-    elif layer_loc == "mlp":
+-        if check_transformerlens_model(model_name):
+-            tensor_name = f"blocks.{layer}.mlp.hook_post"
+-        elif model_name == "nanoGPT":
+-            tensor_name = f"transformer.h.{layer}.mlp.c_fc"
+-        else:
+-            raise NotImplementedError(f"Model {model_name} not supported for MLP")
+-    elif layer_loc == "attn":
+-        if check_transformerlens_model(model_name):
+-            tensor_name = f"blocks.{layer}.hook_resid_post"
+-        else:
+-            raise NotImplementedError(f"Model {model_name} not supported for attention stream")
+-    elif layer_loc == "mlpout":
+-        if check_transformerlens_model(model_name):
+-            tensor_name = f"blocks.{layer}.hook_mlp_out"
+-        else:
+-            raise NotImplementedError(f"Model {model_name} not supported for MLP")
++
++    if "llama" in model_name.lower():
++        if layer_loc == "residual":
++            return f"model.layers.{layer}.input_layernorm"
++        elif layer_loc == "mlp":
++            return f"model.layers.{layer}.mlp.gate_proj"
++        elif layer_loc == "attn":
++            return f"model.layers.{layer}.self_attn.q_proj"
++        elif layer_loc == "mlpout":
++            return f"model.layers.{layer}.post_attention_layernorm"
++    else:
++        if layer_loc == "residual":
++            if check_transformerlens_model(model_name):
++                tensor_name = f"blocks.{layer}.hook_resid_post"
++            else:
++                raise NotImplementedError(f"Model {model_name} not supported for residual stream")
++        elif layer_loc == "attn_concat":
++            if check_transformerlens_model(model_name):
++                tensor_name = f"blocks.{layer}.attn.hook_z"
++            else:
++                raise NotImplementedError(f"Model {model_name} not supported for attention output")
++        elif layer_loc == "mlp":
++            if check_transformerlens_model(model_name):
++                tensor_name = f"blocks.{layer}.mlp.hook_post"
++            elif model_name == "nanoGPT":
++                tensor_name = f"transformer.h.{layer}.mlp.c_fc"
++            else:
++                raise NotImplementedError(f"Model {model_name} not supported for MLP")
++        elif layer_loc == "attn":
++            if check_transformerlens_model(model_name):
++                tensor_name = f"blocks.{layer}.hook_resid_post"
++            else:
++                raise NotImplementedError(f"Model {model_name} not supported for attention stream")
++        elif layer_loc == "mlpout":
++            if check_transformerlens_model(model_name):
++                tensor_name = f"blocks.{layer}.hook_mlp_out"
++            else:
++                raise NotImplementedError(f"Model {model_name} not supported for MLP")
+ 
+     return tensor_name
+ 
+@@ -127,10 +171,38 @@ def make_sentence_dataset(dataset_name: str, max_lines: int = 20_000, start_line
+                 os.system("curl https://the-eye.eu/public/AI/pile/train/00.jsonl.zst > pile0.zst")
+                 os.system("unzstd pile0.zst")
+         dataset = Dataset.from_list(list(read_from_pile("pile0", max_lines=max_lines, start_line=start_line)))
++    elif dataset_name == "openai/gsm8k":
++        print("Loading openai/gsm8k dataset...")
++        dataset = load_dataset(
++            dataset_name,
++            split="train",
++            verification_mode="no_checks",
++            download_mode="reuse_dataset_if_exists"
++        )
++
++        # dataset = dataset.map(lambda x: {"text": x["question"]})
++        dataset = dataset.map(lambda x: {"text": x["question"]}, remove_columns=[])
+     else:
++        #download_config = DownloadConfig(read_timeout=300, retries=5)
+         dataset = load_dataset(dataset_name, split="train")#, split=f"train[{start_line}:{start_line + max_lines}]")
+     return dataset
+ 
++def make_sentence_dataset_with_cot(dataset_name: str, max_lines: int = 20_000, start_line: int = 0):
++    print("DATASET + CoT")
++    dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
++    def prepend_cot_prompt(example):
++        return {"text": FEW_SHOT_COT + f"Q: {example['text']}\nA:"}
++    return dataset.map(prepend_cot_prompt)
++
++def make_sentence_dataset_with_Nocot(dataset_name: str, max_lines: int = 20_000, start_line: int = 0):
++    print("DATASET + NoCoT")
++    dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
++    def prepend_Nocot_prompt(example):
++        return {"text": f"Q: {example['text']}\nA:"}
++    return dataset.map(prepend_Nocot_prompt)
++
++
++
+ 
+ # Nora's Code from https://github.com/AlignmentResearch/tuned-lens/blob/main/tuned_lens/data.py
+ def chunk_and_tokenize(
+@@ -320,6 +392,78 @@ def make_activation_dataset(
+             print(f"Saved undersized chunk {n_saved_chunks} of activations, total size:  {batch_idx * activation_size} ")
+ 
+ 
++# def make_activation_dataset_tl(
++#     sentence_dataset: DataLoader,
++#     model: HookedTransformer,
++#     activation_width: int,
++#     dataset_folders: List[str],
++#     layers: List[int] = [2],
++#     tensor_loc: str = "residual",
++#     chunk_size_gb: float = 2,
++#     device: torch.device = torch.device("cuda:0"),
++#     n_chunks: int = 1,
++#     max_length: int = 256,
++#     model_batch_size: int = 4,
++#     skip_chunks: int = 0,
++#     center_dataset: bool = False
++# ):
++    
++#     with torch.no_grad():
++#         chunk_size = chunk_size_gb * (2**30)  # 2GB
++#         activation_size = (
++#             activation_width * 2 * model_batch_size * max_length
++#         )  # 3072 mlp activations, 2 bytes per half, 1024 context window
++#         max_batches_per_chunk = int(chunk_size // activation_size)
++#         if center_dataset:
++#             chunk_means = {}
++
++#         batches_to_skip = skip_chunks * max_batches_per_chunk
++
++#         dataset_iterator = iter(sentence_dataset)
++
++#         n_activations = 0
++
++#         for _ in range(batches_to_skip):
++#             dataset_iterator.__next__()
++
++#         for chunk_idx in range(n_chunks):
++#             datasets: Dict[int, List] = {layer: [] for layer in layers}
++#             for batch_idx, batch in tqdm(enumerate(dataset_iterator)):
++#                 batch = batch["input_ids"].to(device)
++#                 _, cache = model.run_with_cache(batch, stop_at_layer=max(layers) + 1)
++#                 for layer in layers:
++#                     tensor_name = make_tensor_name(layer, tensor_loc, model.cfg.model_name)
++#                     activation_data = cache[tensor_name].to(torch.float16)
++#                     if tensor_loc == "attn_concat":
++#                         activation_data = rearrange(activation_data, "b s n d -> (b s) (n d)")
++#                     else:
++#                         activation_data = rearrange(activation_data, "b s n -> (b s) n")
++#                     if layer == layers[0]:
++#                         n_activations += activation_data.shape[0]
++#                     datasets[layer].append(activation_data)
++
++#                 if batch_idx >= max_batches_per_chunk:
++#                     break
++
++#             for layer, folder in zip(layers, dataset_folders):
++#                 dataset = datasets[layer]
++#                 if center_dataset:
++#                     if chunk_idx == 0:
++#                         chunk_means[layer] = torch.mean(torch.cat(dataset), dim=0)
++#                     dataset = [x - chunk_means[layer]  for x in dataset]
++#                 save_activation_chunk(dataset, chunk_idx, folder)
++
++#             if len(datasets[layer]) < max_batches_per_chunk:
++#                 print(f"Saved undersized chunk {chunk_idx} of activations, total size: {batch_idx * activation_size}")
++#                 break
++#             else:
++#                 print(f"Saved chunk {chunk_idx} of activations, total size: {(chunk_idx + 1) * batch_idx * activation_size}")
++    
++#     #return ((chunk_means, chunk_stds) if center_dataset else None, n_activations)
++#     return n_activations
++
++from pathlib import Path
++
+ def make_activation_dataset_tl(
+     sentence_dataset: DataLoader,
+     model: HookedTransformer,
+@@ -335,30 +479,30 @@ def make_activation_dataset_tl(
+     skip_chunks: int = 0,
+     center_dataset: bool = False
+ ):
+-    
+     with torch.no_grad():
+-        chunk_size = chunk_size_gb * (2**30)  # 2GB
++        chunk_size = chunk_size_gb * (2**30)
+         activation_size = (
+             activation_width * 2 * model_batch_size * max_length
+-        )  # 3072 mlp activations, 2 bytes per half, 1024 context window
++        )
+         max_batches_per_chunk = int(chunk_size // activation_size)
+         if center_dataset:
+             chunk_means = {}
+ 
+         batches_to_skip = skip_chunks * max_batches_per_chunk
+-
+         dataset_iterator = iter(sentence_dataset)
+-
+         n_activations = 0
+ 
+         for _ in range(batches_to_skip):
+-            dataset_iterator.__next__()
++            next(dataset_iterator)
+ 
+         for chunk_idx in range(n_chunks):
+             datasets: Dict[int, List] = {layer: [] for layer in layers}
++            input_ids_storage = []
++
+             for batch_idx, batch in tqdm(enumerate(dataset_iterator)):
+-                batch = batch["input_ids"].to(device)
+-                _, cache = model.run_with_cache(batch, stop_at_layer=max(layers) + 1)
++                input_ids = batch["input_ids"].to(device)
++                input_ids_storage.append(input_ids.cpu())
++                _, cache = model.run_with_cache(input_ids, stop_at_layer=max(layers) + 1)
+                 for layer in layers:
+                     tensor_name = make_tensor_name(layer, tensor_loc, model.cfg.model_name)
+                     activation_data = cache[tensor_name].to(torch.float16)
+@@ -378,18 +522,22 @@ def make_activation_dataset_tl(
+                 if center_dataset:
+                     if chunk_idx == 0:
+                         chunk_means[layer] = torch.mean(torch.cat(dataset), dim=0)
+-                    dataset = [x - chunk_means[layer]  for x in dataset]
++                    dataset = [x - chunk_means[layer] for x in dataset]
+                 save_activation_chunk(dataset, chunk_idx, folder)
+ 
++                input_ids_tensor = torch.cat(input_ids_storage, dim=0)
++                input_ids_path = Path(folder) / f"input_ids_layer{layer}_chunk{chunk_idx}.pt"
++                torch.save(input_ids_tensor, input_ids_path)
++
+             if len(datasets[layer]) < max_batches_per_chunk:
+                 print(f"Saved undersized chunk {chunk_idx} of activations, total size: {batch_idx * activation_size}")
+                 break
+             else:
+                 print(f"Saved chunk {chunk_idx} of activations, total size: {(chunk_idx + 1) * batch_idx * activation_size}")
+-    
+-    #return ((chunk_means, chunk_stds) if center_dataset else None, n_activations)
++
+     return n_activations
+ 
++
+ def make_activation_dataset_hf(
+     sentence_dataset: Dataset,
+     model: AutoModelForCausalLM,
+@@ -524,8 +672,8 @@ def setup_data_new(
+ 
+     print(f"Processing first {max_lines} lines of dataset...")
+ 
+-    sentence_dataset = make_sentence_dataset(dataset_name, max_lines=max_lines)
+-    tokenized_sentence_dataset, _ = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=max_length)
++    sentence_dataset = make_sentence_dataset_with_Nocot(dataset_name, max_lines=max_lines)
++    tokenized_sentence_dataset = simple_tokenize_per_sample(sentence_dataset, tokenizer, max_length=max_length)
+     make_activation_dataset_hf(
+         tokenized_sentence_dataset,
+         model,
+@@ -563,10 +711,10 @@ def setup_data(
+     max_lines = int((chunk_size_gb * 1e9 * n_chunks) / (activation_width * sentence_len_lower * 2))
+     print(f"Setting max_lines to {max_lines} to minimize sentences processed")
+ 
+-    sentence_dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
++    sentence_dataset = make_sentence_dataset_with_Nocot(dataset_name, max_lines=max_lines, start_line=start_line)
+     tensor_names = [make_tensor_name(layer, layer_loc, model.cfg.model_name) for layer in layers]
+-    tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=MAX_SENTENCE_LEN)
+-    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=MODEL_BATCH_SIZE, shuffle=True)
++    tokenized_sentence_dataset = simple_tokenize_per_sample(sentence_dataset, tokenizer, max_length=MAX_SENTENCE_LEN)
++    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=MODEL_BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+     if baukit:
+         assert type(dataset_folder) == str, "Baukit only supports single dataset folder"
+         make_activation_dataset(
+@@ -603,9 +751,29 @@ def setup_data(
+         )
+         return n_datapoints
+ 
++def simple_tokenize_per_sample(dataset, tokenizer, max_length=256):
++    def tokenize_fn(examples):
++        tokens = tokenizer(
++            examples["text"],
++            truncation=True,
++            max_length=max_length,
++            padding="max_length",
++            return_tensors="pt"
++        )
++        return {"input_ids": tokens["input_ids"].squeeze(0)}
++
++    return dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
++
++def collate_fn(batch):
++    return {
++        "input_ids": torch.stack([torch.tensor(example["input_ids"]) for example in batch])
++    }
++
++
+ 
+ def setup_token_data(cfg, tokenizer, model):
+-    sentence_dataset = make_sentence_dataset(cfg.dataset_name)
+-    tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=cfg.max_length)
+-    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=cfg.model_batch_size, shuffle=True)
++    # sentence_dataset = make_sentence_dataset(cfg.dataset_name)
++    sentence_dataset = make_sentence_dataset_with_Nocot(cfg.dataset_name)
++    tokenized_sentence_dataset = simple_tokenize_per_sample(sentence_dataset, tokenizer, max_length=cfg.max_length)
++    token_loader = DataLoader(tokenized_sentence_dataset, batch_size=cfg.model_batch_size, shuffle=True, collate_fn=collate_fn)
+     return token_loader
+diff --git a/big_sweep.py b/big_sweep.py
+index b9c1b6b..09dad33 100644
+--- a/big_sweep.py
++++ b/big_sweep.py
+@@ -13,6 +13,8 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ import torch.utils.data as data
+ import tqdm
++import gc
++
+ from transformer_lens import HookedTransformer
+ from transformers import GPT2Tokenizer
+ 
+@@ -23,19 +25,69 @@ from activation_dataset import (check_transformerlens_model,
+ from autoencoders.learned_dict import LearnedDict, TiedSAE, UntiedSAE
+ from cluster_runs import dispatch_job_on_chunk
+ from sc_datasets.random_dataset import SparseMixDataset
++from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
++
++
++# def get_model(cfg):
++#     if check_transformerlens_model(cfg.model_name):
++#         model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
++#         if hasattr(model, "tokenizer"):
++#             tokenizer = model.tokenizer
++#         else:
++#             print("Using default tokenizer from gpt2")
++#             tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
++#     else:
++#         print(f"Loading HuggingFace model {cfg.model_name}...")
++#         model = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=torch.float16, device_map="auto")
++#         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+ 
++#     return model, tokenizer
+ 
+ def get_model(cfg):
+     if check_transformerlens_model(cfg.model_name):
+-        model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
+-    else:
+-        raise ValueError("Model name not recognised")
++        # Check if it's a LLaMA model
++        if "llama" in cfg.model_name.lower():
++            # Load the HF model first
++            hf_model = AutoModelForCausalLM.from_pretrained(
++                cfg.model_name,
++                torch_dtype=torch.float16,
++                device_map="auto"
++            )
++
++            model = HookedTransformer.from_pretrained(
++                cfg.model_name,
++                device=cfg.device,
++                hf_model=hf_model,
++            )
++        else:
++            model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
++
++        tokenizer = model.tokenizer if hasattr(model, "tokenizer") else GPT2Tokenizer.from_pretrained("gpt2")
+ 
+-    if hasattr(model, "tokenizer"):
+-        tokenizer = model.tokenizer
+     else:
+-        print("Using default tokenizer from gpt2")
+-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
++        print("Using HuggingFace model")
++
++        if getattr(cfg, "use_4bit", False):
++            print("Loading model in 4bit")
++            bnb_config = BitsAndBytesConfig(
++                load_in_4bit=True,
++                bnb_4bit_compute_dtype=torch.float16,
++                bnb_4bit_use_double_quant=True,
++                bnb_4bit_quant_type="nf4",
++            )
++            model = AutoModelForCausalLM.from_pretrained(
++                cfg.model_name,
++                quantization_config=bnb_config,
++                device_map="auto",
++            )
++        else:
++            model = AutoModelForCausalLM.from_pretrained(
++                cfg.model_name,
++                torch_dtype=torch.float16,
++                device_map="auto"
++            )
++
++        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+ 
+     return model, tokenizer
+ 
+@@ -165,8 +217,13 @@ def ensemble_train_loop(ensemble, cfg, args, ensemble_name, sampler, dataset, pr
+         run = cfg.wandb_instance
+ 
+     for i, batch_idxs in enumerate(sampler):
+-        batch = dataset[batch_idxs].to(args["device"])
+-        losses, aux_buffer = ensemble.step_batch(batch)
++        try:
++            batch = dataset[batch_idxs].to(args["device"])
++            losses, aux_buffer = ensemble.step_batch(batch)
++        except torch.cuda.OutOfMemoryError:
++            print(f"OOM at dict_ratio={args.get('dict_ratio', 'unknown')} batch {i}, skipping...")
++            torch.cuda.empty_cache()
++            continue
+ 
+         num_nonzero = aux_buffer["c"].count_nonzero(dim=-1).float().mean(dim=-1)
+ 
+@@ -237,33 +294,75 @@ def generate_synthetic_dataset(cfg, generator, chunk_size, n_chunks):
+         torch.save(chunk, os.path.join(cfg.dataset_folder, f"{i}.pt"))
+ 
+ 
++# def init_model_dataset(cfg):
++#     cfg.activation_width = get_activation_size(cfg.model_name, cfg.layer_loc)
++
++#     if len(os.listdir(cfg.dataset_folder)) == 0:
++#         print(f"Activations in {cfg.dataset_folder} do not exist, creating them")
++#         transformer, tokenizer = get_model(cfg)
++#         n_datapoints = setup_data(
++#             tokenizer,
++#             transformer,
++#             dataset_name=cfg.dataset_name,
++#             dataset_folder=cfg.dataset_folder,
++#             layer=cfg.layer,
++#             layer_loc=cfg.layer_loc,
++#             n_chunks=cfg.n_chunks,
++#             device=cfg.device,
++#             chunk_size_gb=cfg.chunk_size_gb,
++#             center_dataset=cfg.center_dataset,
++#         )
++#         del transformer, tokenizer
++#         return n_datapoints
++#     else:
++#         print(f"Activations in {cfg.dataset_folder} already exist, loading them")
++#         n_datapoints = 0
++#         n_files = len(os.listdir(cfg.dataset_folder))
++#         for i in tqdm.tqdm(range(n_files)):
++#             n_datapoints += torch.load(os.path.join(cfg.dataset_folder, f"{i}.pt"), map_location="cpu").shape[0]
++#         return n_datapoints
++
++from activation_dataset import setup_data, setup_data_new
++
+ def init_model_dataset(cfg):
+     cfg.activation_width = get_activation_size(cfg.model_name, cfg.layer_loc)
+ 
+     if len(os.listdir(cfg.dataset_folder)) == 0:
+         print(f"Activations in {cfg.dataset_folder} do not exist, creating them")
+         transformer, tokenizer = get_model(cfg)
+-        n_datapoints = setup_data(
+-            tokenizer,
+-            transformer,
+-            dataset_name=cfg.dataset_name,
+-            dataset_folder=cfg.dataset_folder,
+-            layer=cfg.layer,
+-            layer_loc=cfg.layer_loc,
+-            n_chunks=cfg.n_chunks,
+-            device=cfg.device,
+-            chunk_size_gb=cfg.chunk_size_gb,
+-            center_dataset=cfg.center_dataset,
+-        )
+-        del transformer, tokenizer
+-        return n_datapoints
+-    else:
+-        print(f"Activations in {cfg.dataset_folder} already exist, loading them")
+-        n_datapoints = 0
+-        n_files = len(os.listdir(cfg.dataset_folder))
+-        for i in tqdm.tqdm(range(n_files)):
+-            n_datapoints += torch.load(os.path.join(cfg.dataset_folder, f"{i}.pt"), map_location="cpu").shape[0]
+-        return n_datapoints
++
++        if not check_transformerlens_model(cfg.model_name):
++            print("Detected HuggingFace model, using setup_data_new")
++            max_length = 512
++            chunk_size = int(cfg.chunk_size_gb * 1024 ** 3)
++            setup_data_new(
++                model_name=cfg.model_name,
++                dataset_name=cfg.dataset_name,
++                output_folder=cfg.dataset_folder,
++                tensor_names=[f"model.layers.{cfg.layer}.input_layernorm"],
++                chunk_size=chunk_size,
++                n_chunks=cfg.n_chunks,
++                device=cfg.device,
++                max_length=max_length,
++                model_batch_size=cfg.batch_size,
++                precision="float16",
++                shuffle_seed=42,
++            )
++        else:
++            n_datapoints = setup_data(
++                tokenizer,
++                transformer,
++                dataset_name=cfg.dataset_name,
++                dataset_folder=cfg.dataset_folder,
++                layer=cfg.layer,
++                layer_loc=cfg.layer_loc,
++                n_chunks=cfg.n_chunks,
++                device=cfg.device,
++                chunk_size_gb=cfg.chunk_size_gb,
++                center_dataset=cfg.center_dataset,
++            )
++            del transformer, tokenizer
++            return n_datapoints
+ 
+ 
+ def init_synthetic_dataset(cfg):
+@@ -319,8 +418,10 @@ def sweep(ensemble_init_func, cfg):
+         )
+ 
+     if cfg.use_synthetic_dataset:
++        cfg.device = "cuda:0"
+         init_synthetic_dataset(cfg)
+     else:
++        cfg.device = "cuda:0"
+         init_model_dataset(cfg)
+ 
+     print("Initialising ensembles...", end=" ")
+@@ -344,7 +445,11 @@ def sweep(ensemble_init_func, cfg):
+ 
+     print("Ensembles initialised.")
+ 
+-    n_chunks = len(os.listdir(cfg.dataset_folder))
++    n_chunks = len([
++        f for f in os.listdir(cfg.dataset_folder)
++        if f.endswith(".pt") and f[:-3].isdigit()
++    ])
++
+ 
+     chunk_order = np.random.permutation(n_chunks)
+ 
+@@ -355,7 +460,7 @@ def sweep(ensemble_init_func, cfg):
+         print(f"Chunk {i+1}/{len(chunk_order)}")
+ 
+         chunk_loc = os.path.join(cfg.dataset_folder, f"{chunk_idx}.pt")
+-        chunk = torch.load(chunk_loc).to(device="cpu", dtype=torch.float32)
++        chunk = torch.load(chunk_loc).to(device='cpu', dtype=torch.float32)
+         if cfg.center_activations:
+             if i == 0:
+                 print("Centring activations")
+@@ -379,8 +484,22 @@ def sweep(ensemble_init_func, cfg):
+             cfg.iter_folder = os.path.join(cfg.output_folder, f"_{i}")
+             os.makedirs(cfg.iter_folder, exist_ok=True)
+             torch.save(learned_dicts, os.path.join(cfg.iter_folder, "learned_dicts.pt"))
++
++            cfg_dict = {}
++            for k, v in vars(cfg).items():
++                if isinstance(v, torch.device):
++                    cfg_dict[k] = str(v)
++                elif isinstance(v, torch.dtype):
++                    cfg_dict[k] = str(v)
++                elif isinstance(v, torch.Tensor):
++                    cfg_dict[k] = v.tolist()
++                elif isinstance(v, (int, float, str, list, dict, bool, type(None))):
++                    cfg_dict[k] = v
++                else:
++                    cfg_dict[k] = str(v)
++            
+             # save the config as a yaml file
+             with open(os.path.join(cfg.iter_folder, "config.yaml"), "w") as f:
+-                yaml.dump(dict(cfg), f)
++                yaml.dump(cfg_dict, f)
+ 
+         print("\n")
+\ No newline at end of file
+diff --git a/big_sweep_experiments.py b/big_sweep_experiments.py
+index 73b9217..86e15b4 100644
+--- a/big_sweep_experiments.py
++++ b/big_sweep_experiments.py
+@@ -10,7 +10,7 @@ import torchopt
+ import tqdm
+ 
+ from config import EnsembleArgs
+-from autoencoders.direct_coef_search import DirectCoefOptimizer
++#from autoencoders.direct_coef_search import DirectCoefOptimizer
+ from autoencoders.ensemble import FunctionalEnsemble
+ from autoencoders.mlp_tests import FunctionalPositiveTiedSAE
+ from autoencoders.residual_denoising_autoencoder import (
+@@ -48,7 +48,7 @@ def tied_vs_not_experiment(cfg: EnsembleArgs):
+     dict_sizes = [cfg.activation_width * ratio for ratio in dict_ratios]
+ 
+     ensembles = []
+-    devices = [f"cuda:{i}" for i in range(8)]
++    devices = ["cuda:0"]
+ 
+     for i in range(2):
+         cfgs = product(l1_values[i * 2 : (i + 1) * 2], bias_decays)
+@@ -233,7 +233,7 @@ def topk_experiment(cfg: EnsembleArgs):
+     sparsity_levels = np.arange(1, 161, 10)
+     dict_ratios = [0.5, 1, 2, 4, 0.5, 1, 2, 4]
+     dict_sizes = [int(cfg.activation_width * ratio) for ratio in dict_ratios]
+-    devices = [f"cuda:{i}" for i in range(8)]
++    devices = [f"cuda:{i}" for i in range(1)]
+ 
+     ensembles = []
+     for i in tqdm.tqdm(range(8)):
+@@ -268,7 +268,7 @@ def synthetic_linear_range(cfg: EnsembleArgs):
+     dict_sizes = [int(cfg.activation_width * ratio) for ratio in dict_ratios]
+     settings = list(product([l1_vals[:16], l1_vals[16:]], dict_ratios))
+ 
+-    devices = [f"cuda:{i}" for i in range(8)]
++    devices = [f"cuda:{i}" for i in range(1)]
+ 
+     ensembles = []
+     for i in tqdm.tqdm(range(8)):
+@@ -293,7 +293,7 @@ def synthetic_linear_range(cfg: EnsembleArgs):
+ 
+ def dense_l1_range_experiment(cfg: EnsembleArgs):
+     l1_values = np.logspace(-4, -2, 16)
+-    devices = [f"cuda:{i}" for i in range(8)]
++    devices = [f"cuda:{i}" for i in range(1)]
+ 
+     ensembles = []
+     for i in range(8):
+@@ -340,7 +340,7 @@ def dense_l1_range_experiment(cfg: EnsembleArgs):
+ 
+ def residual_denoising_experiment(cfg: EnsembleArgs):
+     l1_values = np.logspace(-5, -3, 16)
+-    devices = [f"cuda:{i}" for i in range(8)]
++    devices = [f"cuda:{i}" for i in range(1)]
+ 
+     ensembles = []
+     for i in range(4):
+@@ -378,7 +378,7 @@ def residual_denoising_experiment(cfg: EnsembleArgs):
+ 
+ def residual_denoising_comparison(cfg: EnsembleArgs):
+     l1_values = np.logspace(-4, -2, 16)
+-    devices = [f"cuda:{i}" for i in range(4)]
++    devices = [f"cuda:{i}" for i in range(1)]
+ 
+     ensembles = []
+     for i in range(4):
+@@ -402,7 +402,7 @@ def residual_denoising_comparison(cfg: EnsembleArgs):
+ 
+ def thresholding_experiment(cfg: EnsembleArgs):
+     l1_values = np.logspace(-4, -2, 16)
+-    devices = [f"cuda:{i}" for i in range(4)]
++    devices = [f"cuda:{i}" for i in range(1)]
+ 
+     dict_ratio = 4
+ 
+@@ -496,7 +496,7 @@ def run_resid_denoise() -> None:
+ 
+ def zero_l1_baseline(cfg: EnsembleArgs):
+     l1_values = np.array([0.0])
+-    devices = ["cuda:1"]
++    devices = ["cuda:0"]
+ 
+     ensembles = []
+     cfgs = l1_values
+@@ -547,7 +547,7 @@ def dict_ratio_experiment(cfg: EnsembleArgs):
+ 
+     l1_value = 1e-3
+ 
+-    devices = [f"cuda:{i}" for i in [1, 2, 3, 4, 6, 7]]
++    devices = [f"cuda:{i}" for i in [0]]
+ 
+     ensembles = []
+     for i in range(6):
+@@ -852,7 +852,7 @@ def pythia_1_4_b_dict(cfg: EnsembleArgs):
+     dict_ratio = 6
+     l1_values = np.logspace(-4, -2, 5)
+     dict_size = int(cfg.activation_width * dict_ratio)
+-    devices = ["cuda:1"]
++    devices = ["cuda:0"]
+ 
+     ensembles = []
+     for i in range(1):
+@@ -1202,13 +1202,17 @@ def simple_run() -> None:
+     sweep(simple_setoff, cfg)
+ 
+ 
++
++
+ def run_single_layer() -> None:
+     cfg = EnsembleArgs()
+-    cfg.model_name = "EleutherAI/pythia-70m-deduped"
+-    cfg.dataset_name = "openwebtext"
++    # cfg.model_name = "EleutherAI/pythia-70m-deduped"
++    cfg.model_name = "EleutherAI/pythia-2.8b"
++    # cfg.dataset_name = "openwebtext"
++    cfg.dataset_name = "openai/gsm8k"
+ 
+     cfg.batch_size = 1024
+-    cfg.use_wandb = True
++    cfg.use_wandb = False
+     cfg.wandb_images = False
+     cfg.activation_width = 1024
+     cfg.save_every = 5
+@@ -1216,16 +1220,24 @@ def run_single_layer() -> None:
+     cfg.n_epochs = 5
+     cfg.tied_ae = True
+     cfg.center_dataset = True
++    cfg.use_4bit = True
+     for layer_loc in ["residual"]:
+-        cfg.dataset_folder = f"owtchunks_zeromean_pythia70m_l{cfg.layer}_{layer_loc}"
++        cfg.dataset_folder = f"NoCoT_gsm8kchunks_zeromean_pythia2.8b_l{cfg.layer}_{layer_loc}"
++        # cfg.dataset_folder = f"CoT_gsm8kchunks_zeromean_pythia2.8b_l{cfg.layer}_{layer_loc}"
++        # cfg.dataset_folder = f"NoCoT_gsm8kchunks_zeromean_pythia70m_l{cfg.layer}_{layer_loc}"
++        # cfg.dataset_folder = f"CoT_gsm8kchunks_zeromean_pythia70m_l{cfg.layer}_{layer_loc}"
+         # shutil.rmtree(cfg.dataset_folder)
+-        for dict_ratio in [4, 8, 16, 32]:
++        # for dict_ratio in [4, 8, 16, 32]:
++        for dict_ratio in [4, 8]:
+             cfg.layer_loc = layer_loc
+             cfg.learned_dict_ratio = dict_ratio
+ 
+             print(f"Running layer {cfg.layer}, layer location {layer_loc}, dict_ratio {dict_ratio}")
+ 
+-            cfg.output_folder = f"/mnt/ssd-cluster/pythia70m_centered/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
++            cfg.output_folder = f"./mnt/ssd-cluster/pythia2.8b_centered_gsm8k_NoCoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
++            # cfg.output_folder = f"./mnt/ssd-cluster/pythia2.8b_centered_gsm8k_CoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
++            # cfg.output_folder = f"./mnt/ssd-cluster/pythia70m_centered_gsm8k_CoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
++            # cfg.output_folder = f"./mnt/ssd-cluster/pythia70m_centered_gsm8k_NoCoT/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
+ 
+             print(f"Output folder: {cfg.output_folder}, dataset folder: {cfg.dataset_folder}")
+ 
+@@ -1249,6 +1261,8 @@ def run_single_layer_gpt2() -> None:
+     cfg.n_chunks = 10
+     cfg.n_epochs = 4
+     cfg.tied_ae = True
++    cfg.use_4bit = True
++
+     for layer_loc in ["residual"]:
+         cfg.dataset_folder = f"pilechunks_gpt2sm_l{cfg.layer}_{layer_loc}"
+         # shutil.rmtree(cfg.dataset_folder)
+@@ -1269,6 +1283,46 @@ def run_single_layer_gpt2() -> None:
+             sweep(simple_setoff, cfg)
+             
+ 
++def run_single_layer_new() -> None:
++
++    cfg = EnsembleArgs()
++
++    cfg.model_name = "NousResearch/Llama-2-7b-hf"
++    cfg.dataset_name = "openai/gsm8k"
++
++    cfg.batch_size = 4
++    cfg.use_wandb = False
++    cfg.wandb_images = False
++    # cfg.activation_width = 4096
++    cfg.save_every = 5
++    cfg.n_chunks = 5
++    cfg.n_epochs = 5
++    cfg.tied_ae = True
++    cfg.center_dataset = True
++    cfg.use_synthetic_dataset = False
++    cfg.dtype = torch.float32
++    cfg.lr = 1e-3
++
++    for layer_loc in ["residual"]:
++        cfg.layer = 2
++        cfg.layer_loc = layer_loc
++        cfg.dataset_folder = f"activation_data_llama2_7b_gsm8k_layer{cfg.layer}_{layer_loc}"
++        # shutil.rmtree(cfg.dataset_folder)
++        for dict_ratio in [4, 8, 16, 32]:
++            cfg.learned_dict_ratio = dict_ratio
++
++            print(f"Running layer {cfg.layer}, layer location {layer_loc}, dict_ratio {dict_ratio}")
++
++            cfg.output_folder = f"./mnt/ssd-cluster/llama2_7b_centered_gsm8k/{'tied' if cfg.tied_ae else 'untied'}_{layer_loc}_l{cfg.layer}_r{int(cfg.learned_dict_ratio)}"
++
++            print(f"Output folder: {cfg.output_folder}, dataset folder: {cfg.dataset_folder}")
++
++            sweep(simple_setoff, cfg)
++
++
++
++
++
+ if __name__ == "__main__":
+     # import sys
+     # device = sys.argv[1]
+@@ -1276,5 +1330,6 @@ if __name__ == "__main__":
+     # sys.argv = sys.argv[:1]
+     # run_all_zeros(device, layer)
+     # setup_positives()
+-    #run_single_layer()
+-    run_pythia_1_4_b_sweep()
+\ No newline at end of file
++    run_single_layer()
++    # run_pythia_1_4_b_sweep()
++    # run_single_layer_new()
+\ No newline at end of file
+diff --git a/config.py b/config.py
+index 6e3cc29..ba1ae87 100644
+--- a/config.py
++++ b/config.py
+@@ -44,7 +44,7 @@ class TrainArgs(BaseArgs):
+     n_chunks: int = 30
+     chunk_size_gb: float = 2.0
+     batch_size: int = 256
+-    use_wandb: bool = True
++    use_wandb: bool = False
+     wandb_images: bool = False
+     lr: float = 1e-3
+     l1_alpha: float = 1e-3
+@@ -56,6 +56,8 @@ class EnsembleArgs(TrainArgs):
+     activation_width: int = 512
+     use_synthetic_dataset: bool = False
+     bias_decay: float = 0.0
++    n_repetitions: int = None
++    center_activations: bool = False
+ 
+ @dataclass
+ class SyntheticEnsembleArgs(EnsembleArgs):
+@@ -71,7 +73,7 @@ class SyntheticEnsembleArgs(EnsembleArgs):
+ @dataclass
+ class ErasureArgs(BaseArgs):
+     model_name: str = "EleutherAI/pythia-70m-deduped"
+-    device: str = "cuda:4"
++    device: str = "cuda:0"
+     layer: Optional[int] = None
+     count_cutoff: int = 10000
+     output_folder: str = "output_erasure_pca"
+@@ -116,14 +118,14 @@ class InterpArgs(BaseArgs):
+     layer_loc: str = "residual"
+     device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+     n_feats_explain: int = 10
+-    load_interpret_autoencoder: str = ""
++    load_interpret_autoencoder: str = "./mnt/ssd-cluster/pythia70m_centered_gsm8k/tied_residual_l2_r4/_0/learned_dicts.pt"
+     tied_ae: bool = False
+     interp_name: str = ""
+     sort_mode: str = "max"
+     use_decoder: bool = True
+     df_n_feats: int = 200
+     top_k: int = 50
+-    save_loc: str = ""
++    save_loc: str = "./mnt/ssd-cluster/auto_interp_results_gsm8k/"
+     
+     
+ @dataclass
+diff --git a/interpret.py b/interpret.py
+index 5f515a4..4061c98 100644
+--- a/interpret.py
++++ b/interpret.py
+@@ -32,6 +32,7 @@ with open("secrets.json") as f:
+     os.environ["OPENAI_API_KEY"] = secrets["openai_key"]
+ 
+ mp.set_start_method("spawn", force=True)
++np.seterr(divide='raise', invalid='raise')
+ 
+ from neuron_explainer.activations.activation_records import \
+     calculate_max_activation
+@@ -46,19 +47,22 @@ from neuron_explainer.explanations.scoring import (
+     aggregate_scored_sequence_simulations, simulate_and_score)
+ from neuron_explainer.explanations.simulator import ExplanationNeuronSimulator
+ from neuron_explainer.fast_dataclasses import loads
++from neuron_explainer.explanations.few_shot_examples import FewShotExampleSet
++from neuron_explainer.explanations.simulator import LogprobFreeExplanationTokenSimulator
+ 
+-EXPLAINER_MODEL_NAME = "gpt-4"  # "gpt-3.5-turbo"
+-SIMULATOR_MODEL_NAME = "text-davinci-003"
++EXPLAINER_MODEL_NAME = "gpt-3.5-turbo"
++SIMULATOR_MODEL_NAME = "gpt-3.5-turbo"
+ 
+-OPENAI_MAX_FRAGMENTS = 50000
+-OPENAI_FRAGMENT_LEN = 64
++
++OPENAI_MAX_FRAGMENTS = 8000
++OPENAI_FRAGMENT_LEN = 32
+ OPENAI_EXAMPLES_PER_SPLIT = 5
+ N_SPLITS = 4
+ TOTAL_EXAMPLES = OPENAI_EXAMPLES_PER_SPLIT * N_SPLITS
+ REPLACEMENT_CHAR = "�"
+ MAX_CONCURRENT: Any = None
+ 
+-BASE_FOLDER = "/mnt/ssd-cluster/sweep_interp"
++BASE_FOLDER = "./mnt/ssd-cluster/sweep_interp"
+ 
+ 
+ # Replaces the load_neuron function in neuron_explainer.activations.activations because couldn't get blobfile to work
+@@ -84,7 +88,7 @@ def make_feature_activation_dataset(
+     learned_dict: LearnedDict,
+     layer: int,
+     layer_loc: str,
+-    device: str = "cpu",
++    device: str = "gpu",
+     n_fragments=OPENAI_MAX_FRAGMENTS,
+     max_features: int = 0,  # number of features to store activations for, 0 for all
+     random_fragment=True,  # used for debugging
+@@ -105,7 +109,8 @@ def make_feature_activation_dataset(
+     else:
+         feat_dim = learned_dict.n_feats
+ 
+-    sentence_dataset = load_dataset("openwebtext", split="train", streaming=True)
++    # sentence_dataset = load_dataset("openwebtext", split="train", streaming=True)
++    sentence_dataset = load_dataset("openai/gsm8k", split="train")
+ 
+     if model.cfg.model_name == "nanoGPT":
+         tokenizer_model = HookedTransformer.from_pretrained("gpt2", device=device)
+@@ -138,24 +143,50 @@ def make_feature_activation_dataset(
+                     f"Added {n_added} fragments, thrown {n_thrown} fragments\t\t\t\t\t\t",
+                     end="\r",
+                 )
+-                sentence = next(iter_dataset)
++                try:
++                    sentence = next(iter_dataset)
++                except StopIteration:
++                    print("Dataset exhausted, exit inner loop")
++                    break
++                # sentence = next(iter_dataset)
+                 # split the sentence into fragments
+-                sentence_tokens = tokenizer_model.to_tokens(sentence["text"], prepend_bos=False).to(device)
++                # sentence_tokens = tokenizer_model.to_tokens(sentence["text"], prepend_bos=False).to(device)
++                sentence_tokens = tokenizer_model.to_tokens(sentence["question"], prepend_bos=False).to(device)
+                 n_tokens = sentence_tokens.shape[1]
+-                # get a random fragment from the sentence - only taking one fragment per sentence so examples aren't correlated]
+-                if random_fragment:
+-                    token_start = np.random.randint(0, n_tokens - OPENAI_FRAGMENT_LEN)
++                # # get a random fragment from the sentence - only taking one fragment per sentence so examples aren't correlated]
++                # if random_fragment:
++                #     token_start = np.random.randint(0, n_tokens - OPENAI_FRAGMENT_LEN)
++                # else:
++                #     token_start = 0
++                # fragment_tokens = sentence_tokens[:, token_start : token_start + OPENAI_FRAGMENT_LEN]
++                # token_strs = tokenizer_model.to_str_tokens(fragment_tokens[0])
++                # if REPLACEMENT_CHAR in token_strs:
++                #     n_thrown += 1
++                #     continue
++
++
++                if n_tokens > OPENAI_FRAGMENT_LEN:
++                    fragment_tokens = sentence_tokens[:, :OPENAI_FRAGMENT_LEN]
++                elif n_tokens < OPENAI_FRAGMENT_LEN:
++                    pad_len = OPENAI_FRAGMENT_LEN - n_tokens
++                    if hasattr(tokenizer_model, "tokenizer") and tokenizer_model.tokenizer.pad_token_id is not None:
++                        pad_token_id = tokenizer_model.tokenizer.pad_token_id
++                    else:
++                        pad_token_id = 0
++                    padding = torch.full((1, pad_len), pad_token_id, dtype=sentence_tokens.dtype, device=device)
++                    fragment_tokens = torch.cat([sentence_tokens, padding], dim=1)
+                 else:
+-                    token_start = 0
+-                fragment_tokens = sentence_tokens[:, token_start : token_start + OPENAI_FRAGMENT_LEN]
+-                token_strs = tokenizer_model.to_str_tokens(fragment_tokens[0])
+-                if REPLACEMENT_CHAR in token_strs:
+-                    n_thrown += 1
+-                    continue
+-
+-                fragment_strs.append(token_strs)
++                    fragment_tokens = sentence_tokens
++                    
+                 fragments.append(fragment_tokens)
++                fragment_strs.append(tokenizer_model.to_str_tokens(fragment_tokens[0]))
++
+ 
++
++                
++            if len(fragments) == 0:
++                print("No more data available, exit outer loop")
++                break
+             tokens = torch.cat(fragments, dim=0)
+             assert tokens.shape == (batch_size, OPENAI_FRAGMENT_LEN), tokens.shape
+ 
+@@ -175,6 +206,7 @@ def make_feature_activation_dataset(
+                 token_ids = fragment_tokens[0].tolist()
+ 
+                 feature_activation_data = learned_dict.encode(activation_data)
++
+                 feature_activation_maxes = torch.max(feature_activation_data, dim=0)[0]
+ 
+                 activation_maxes_table[n_added, :] = feature_activation_maxes.cpu().numpy()[:feat_dim]
+@@ -331,6 +363,9 @@ async def interpret(base_df: pd.DataFrame, save_folder: str, n_feats_to_explain:
+         train_activation_records = neuron_record.train_activation_records(slice_params)
+         valid_activation_records = neuron_record.valid_activation_records(slice_params)
+ 
++        print("Valid activation records:", valid_activation_records)
++
++
+         explainer = TokenActivationPairExplainer(
+             model_name=EXPLAINER_MODEL_NAME,
+             prompt_format=PromptFormat.HARMONY_V4,
+@@ -346,15 +381,26 @@ async def interpret(base_df: pd.DataFrame, save_folder: str, n_feats_to_explain:
+         print(f"Feature {feat_n}, {explanation=}")
+ 
+         # Simulate and score the explanation.
+-        format = PromptFormat.HARMONY_V4 if SIMULATOR_MODEL_NAME == "gpt-3.5-turbo" else PromptFormat.INSTRUCTION_FOLLOWING
++        # format = PromptFormat.HARMONY_V4 if SIMULATOR_MODEL_NAME == "gpt-3.5-turbo" else PromptFormat.INSTRUCTION_FOLLOWING
++        format = PromptFormat.HARMONY_V4
++        # simulator = UncalibratedNeuronSimulator(
++        #     ExplanationNeuronSimulator(
++        #         SIMULATOR_MODEL_NAME,
++        #         explanation,
++        #         max_concurrent=MAX_CONCURRENT,
++        #         prompt_format=format,
++        #     )
++        # )
+         simulator = UncalibratedNeuronSimulator(
+-            ExplanationNeuronSimulator(
+-                SIMULATOR_MODEL_NAME,
+-                explanation,
++            LogprobFreeExplanationTokenSimulator(
++                model_name=SIMULATOR_MODEL_NAME,
++                explanation=explanation,
+                 max_concurrent=MAX_CONCURRENT,
++                few_shot_example_set=FewShotExampleSet.NEWER,
+                 prompt_format=format,
+             )
+         )
++        
+         scored_simulation = await simulate_and_score(simulator, valid_activation_records)
+         score = scored_simulation.get_preferred_score()
+         assert len(scored_simulation.scored_sequence_simulations) == 10
+@@ -539,8 +585,8 @@ def worker(queue, device_id):
+ 
+ 
+ def interpret_across_baselines(n_gpus: int = 3):
+-    baselines_dir = "/mnt/ssd-cluster/baselines"
+-    save_dir = "/mnt/ssd-cluster/auto_interp_results/"
++    baselines_dir = "./mnt/ssd-cluster/baselines"
++    save_dir = "./mnt/ssd-cluster/auto_interp_results/"
+     os.makedirs(save_dir, exist_ok=True)
+     base_cfg = InterpArgs()
+ 
+@@ -582,8 +628,8 @@ def interpret_across_baselines(n_gpus: int = 3):
+ 
+ def interpret_across_big_sweep(l1_val: float, n_gpus: int = 1):
+     base_cfg = InterpArgs()
+-    base_dir = "/mnt/ssd-cluster/bigrun0308"
+-    save_dir = "/mnt/ssd-cluster/auto_interp_results/"
++    base_dir = "./mnt/ssd-cluster/bigrun0308"
++    save_dir = "./mnt/ssd-cluster/auto_interp_results/"
+     
+     n_chunks_training = 10
+     os.makedirs(save_dir, exist_ok=True)
+@@ -642,8 +688,8 @@ def interpret_across_big_sweep(l1_val: float, n_gpus: int = 1):
+ 
+ def interpret_across_chunks(l1_val: float, n_gpus: int = 1):
+     base_cfg = InterpArgs()
+-    base_dir = "/mnt/ssd-cluster/longrun2408"
+-    save_dir = "/mnt/ssd-cluster/auto_interp_results_overtime/"
++    base_dir = "./mnt/ssd-cluster/longrun2408"
++    save_dir = "./mnt/ssd-cluster/auto_interp_results_overtime/"
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     all_folders = os.listdir(base_dir)
+@@ -689,7 +735,7 @@ def interpret_across_chunks(l1_val: float, n_gpus: int = 1):
+ 
+ 
+ def read_results(activation_name: str, score_mode: str) -> None:
+-    results_folder = os.path.join("/mnt/ssd-cluster/auto_interp_results", activation_name)
++    results_folder = os.path.join("./mnt/ssd-cluster/auto_interp_results", activation_name)
+ 
+     scores = read_scores(
+         results_folder, score_mode
+@@ -770,7 +816,7 @@ if __name__ == "__main__":
+         else:
+             score_modes = [cfg.score_mode]
+  
+-        base_path = "/mnt/ssd-cluster/auto_interp_results"
++        base_path = "./mnt/ssd-cluster/auto_interp_results"
+ 
+         if cfg.run_all:
+             activation_names = [x for x in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, x))]
+@@ -782,6 +828,7 @@ if __name__ == "__main__":
+                 read_results(activation_name, score_mode)
+ 
+     elif len(sys.argv) > 1 and sys.argv[1] == "run_group":
++        sys.argv.pop(1)
+         cfg = InterpArgs()
+         run_from_grouped(cfg, cfg.load_interpret_autoencoder)
+ 
+@@ -810,6 +857,6 @@ if __name__ == "__main__":
+             run_folder(cfg)
+         else:
+             learned_dict = torch.load(cfg.load_interpret_autoencoder, map_location=cfg.device)
+-            save_folder = f"/mnt/ssd-cluster/auto_interp_results/l{cfg.layer}_{cfg.layer_loc}"
++            save_folder = f"./mnt/ssd-cluster/auto_interp_results/l{cfg.layer}_{cfg.layer_loc}"
+             cfg.save_loc = os.path.join(save_folder, cfg.load_interpret_autoencoder)
+             run(learned_dict, cfg)
+diff --git a/requirements.txt b/requirements.txt
+index ac36d25..e94f75c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -16,7 +16,7 @@ certifi==2023.7.22
+ cffi==1.15.1
+ charset-normalizer==3.1.0
+ click==8.1.3
+-cmake==3.26.4
++# cmake==3.26.4
+ constantly==15.1.0
+ contourpy==1.0.7
+ cryptography==41.0.3
+@@ -39,7 +39,7 @@ graphviz==0.20.1
+ h11==0.14.0
+ hkdf==0.0.3
+ httpcore==0.17.2
+-httpx==0.24.1
++httpx>=0.25.0
+ huggingface-hub==0.15.1
+ humanize==4.6.0
+ hyperlink==21.0.0
+@@ -66,7 +66,7 @@ multiprocess==0.70.14
+ mypy==1.3.0
+ mypy-extensions==1.0.0
+ networkx==3.1
+-neuron-explainer @ git+https://github.com/openai/automated-interpretability.git#subdirectory=neuron-explainer
++neuron-explainer @ git+https://github.com/sekirodie1000/automated-interpretability.git#subdirectory=neuron-explainer
+ numpy==1.24.3
+ nvidia-cublas-cu11==11.10.3.66
+ nvidia-cuda-cupti-cu11==11.7.101

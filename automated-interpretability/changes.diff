@@ -1,0 +1,166 @@
+diff --git a/neuron-explainer/neuron_explainer/api_client.py b/neuron-explainer/neuron_explainer/api_client.py
+index 46b5e96..cedf3d0 100644
+--- a/neuron-explainer/neuron_explainer/api_client.py
++++ b/neuron-explainer/neuron_explainer/api_client.py
+@@ -126,9 +126,26 @@ class ApiClient:
+             http_client = await stack.enter_async_context(
+                 httpx.AsyncClient(timeout=timeout_seconds)
+             )
++            print(f"DEBUG: kwargs = {kwargs}")
++            if "prompt" in kwargs and "messages" not in kwargs:
++                if isinstance(kwargs["prompt"], list):
++                    user_message = "\n".join([msg["content"] for msg in kwargs["prompt"]])
++                else:
++                    user_message = kwargs["prompt"]
++        
++                kwargs["messages"] = [
++                    {"role": "system", "content": "You are an AI assistant."},
++                    {"role": "user", "content": user_message}
++                ]
++                del kwargs["prompt"]
++            
++            print(f"DEBUG: Updated kwargs = {kwargs}")
+             # If the request has a "messages" key, it should be sent to the /chat/completions
+             # endpoint. Otherwise, it should be sent to the /completions endpoint.
+-            url = BASE_API_URL + ("/chat/completions" if "messages" in kwargs else "/completions")
++            url = BASE_API_URL + "/chat/completions"
++    
++            print(f"DEBUG: Sending request to {url}")
++            # url = BASE_API_URL + ("/chat/completions" if "messages" in kwargs else "/completions")
+             kwargs["model"] = self.model_name
+             response = await http_client.post(url, headers=API_HTTP_HEADERS, json=kwargs)
+         # The response json has useful information but the exception doesn't include it, so print it
+diff --git a/neuron-explainer/neuron_explainer/explanations/explainer.py b/neuron-explainer/neuron_explainer/explanations/explainer.py
+index 83411b6..0489c5f 100644
+--- a/neuron-explainer/neuron_explainer/explanations/explainer.py
++++ b/neuron-explainer/neuron_explainer/explanations/explainer.py
+@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
+ # Try other options like "this neuron activates for".
+ EXPLANATION_PREFIX = "the main thing this neuron does is find"
+ 
++def simple_tokenize_per_sample(dataset, tokenizer, max_length=256):
++    def tokenize_fn(ex):
++        tokens = tokenizer(
++            ex["text"],
++            truncation=True,
++            max_length=max_length,
++            padding="max_length",
++            return_tensors="pt",
++        )
++        return {"input_ids": tokens["input_ids"][0]}
++    return dataset.map(tokenize_fn, remove_columns=dataset.column_names)
++
+ 
+ def _split_numbered_list(text: str) -> list[str]:
+     """Split a numbered list into a list of strings."""
+diff --git a/neuron-explainer/neuron_explainer/explanations/scoring.py b/neuron-explainer/neuron_explainer/explanations/scoring.py
+index f7f263a..ec6608d 100644
+--- a/neuron-explainer/neuron_explainer/explanations/scoring.py
++++ b/neuron-explainer/neuron_explainer/explanations/scoring.py
+@@ -22,10 +22,15 @@ def flatten_list(list_of_lists: Sequence[Sequence[Any]]) -> list[Any]:
+     return [item for sublist in list_of_lists for item in sublist]
+ 
+ 
+-def correlation_score(
+-    real_activations: Sequence[float] | np.ndarray,
+-    predicted_activations: Sequence[float] | np.ndarray,
+-) -> float:
++# def correlation_score(
++#     real_activations: Sequence[float] | np.ndarray,
++#     predicted_activations: Sequence[float] | np.ndarray,
++# ) -> float:
++#     return np.corrcoef(real_activations, predicted_activations)[0, 1]
++
++def correlation_score(real_activations, predicted_activations):
++    if np.std(real_activations) == 0 or np.std(predicted_activations) == 0:
++        return 0.0
+     return np.corrcoef(real_activations, predicted_activations)[0, 1]
+ 
+ 
+@@ -34,18 +39,34 @@ def score_from_simulation(
+     simulation: SequenceSimulation,
+     score_function: Callable[[Sequence[float] | np.ndarray, Sequence[float] | np.ndarray], float],
+ ) -> float:
++    # print("real_activations:", real_activations.activations)
++    # print("predicted_activations:", simulation.expected_activations) 
++
+     return score_function(real_activations.activations, simulation.expected_activations)
+ 
+ 
+-def rsquared_score_from_sequences(
+-    real_activations: Sequence[float] | np.ndarray,
+-    predicted_activations: Sequence[float] | np.ndarray,
+-) -> float:
+-    return float(
+-        1
+-        - np.mean(np.square(np.array(real_activations) - np.array(predicted_activations)))
+-        / np.mean(np.square(np.array(real_activations)))
+-    )
++# def rsquared_score_from_sequences(
++#     real_activations: Sequence[float] | np.ndarray,
++#     predicted_activations: Sequence[float] | np.ndarray,
++# ) -> float:
++#     return float(
++#         1
++#         - np.mean(np.square(np.array(real_activations) - np.array(predicted_activations)))
++#         / np.mean(np.square(np.array(real_activations)))
++#     )
++
++def rsquared_score_from_sequences(real_activations, predicted_activations):
++    real_activations = np.array(real_activations)
++    predicted_activations = np.array(predicted_activations)
++
++    numerator = np.mean(np.square(real_activations - predicted_activations))
++    denominator = np.mean(np.square(real_activations))
++
++    if denominator == 0:
++        return 0.0
++
++    return float(1 - numerator / denominator)
++
+ 
+ 
+ def absolute_dev_explained_score_from_sequences(
+diff --git a/neuron-explainer/neuron_explainer/explanations/simulator.py b/neuron-explainer/neuron_explainer/explanations/simulator.py
+index 4f50f4e..a857abc 100644
+--- a/neuron-explainer/neuron_explainer/explanations/simulator.py
++++ b/neuron-explainer/neuron_explainer/explanations/simulator.py
+@@ -329,9 +329,8 @@ class ExplanationNeuronSimulator(NeuronSimulator):
+         prompt = self.make_simulation_prompt(tokens)
+ 
+         generate_kwargs: dict[str, Any] = {
+-            "max_tokens": 0,
+-            "echo": True,
+-            "logprobs": 15,
++            "max_tokens": 1,
++            "logprobs": True,
+         }
+         if self.prompt_format == PromptFormat.HARMONY_V4:
+             assert isinstance(prompt, list)
+@@ -471,7 +470,7 @@ class ExplanationTokenByTokenSimulator(NeuronSimulator):
+             token_index_to_score=token_index_to_score,
+         )
+         return await self.api_client.make_request(
+-            prompt=prompt, max_tokens=1, echo=False, logprobs=15
++            prompt=prompt, max_tokens=1, logprobs=True
+         )
+ 
+     def _add_single_token_simulation_subprompt(
+@@ -718,7 +717,7 @@ class LogprobFreeExplanationTokenSimulator(NeuronSimulator):
+             self.explanation,
+         )
+         response = await self.api_client.make_request(
+-            prompt=prompt, echo=False, max_tokens=1000
++            prompt=prompt, max_tokens=1000
+         )
+         assert len(response["choices"]) == 1
+ 
+@@ -750,7 +749,7 @@ class LogprobFreeExplanationTokenSimulator(NeuronSimulator):
+     ) -> Union[str, list[HarmonyMessage]]:
+         """Make a few-shot prompt for predicting the neuron's activations on a sequence."""
+         assert explanation != ""
+-        prompt_builder = PromptBuilder(allow_extra_system_messages=True)
++        prompt_builder = PromptBuilder()
+         prompt_builder.add_message(
+             Role.SYSTEM,
+             """We're studying neurons in a neural network. Each neuron looks for some particular thing in a short document. Look at  an explanation of what the neuron does, and try to predict its activations on a particular token.
