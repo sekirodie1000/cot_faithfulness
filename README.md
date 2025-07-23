@@ -5,13 +5,16 @@ We investigate the faithfulness of Chain-of-Thought(CoT) prompting by applying a
 
 ## Code Structure
 
-This project builds on top of:
+This project is based on the following open-source repositories:
 
-- https://github.com/sekirodie1000/automated-interpretability (forked from OpenAI)
-- https://github.com/sekirodie1000/sparse_coding (forked from Cunningham et al.)
+- [`automated-interpretability`](https://github.com/openai/automated-interpretability) (originally from OpenAI)
+- [`sparse_coding`](https://github.com/HoagyC/sparse_coding) (from Cunningham et al.)
 
-We forked and slightly modified the above repositories to support our experiments.  
-The custom code is located in the `experiments/` directory.
+We made targeted modifications to both codebases to support our experiments.  
+The full modified code is included in this repository.  
+All modifications are documented in the file [`changes.diff`](./changes.diff).
+
+Our experiment-specific logic is implemented in the `experiments/` directory.
 
 ### Key Scripts
 
@@ -27,16 +30,23 @@ We also made minor adjustments to the original SAE codebase to expose internal a
 
 ## Installation
 
-This project depends on our custom forks of two repositories.  
-Please follow these steps before running any experiments:
+This project depends on our modified versions of both `sparse_coding` and `automated-interpretability`.  
+To set up the environment:
 
-```bash
-# 1. Clone the sparse_coding fork
-git clone https://github.com/sekirodie1000/sparse_coding.git
-cd sparse_coding
+1. **Clone and install `sparse_coding`**:
 
-# 2. Install dependencies
-# This will also install neuron-explainer from the forked automated-interpretability repo
-pip install -r requirements.txt
+   ```bash
+   git clone https://github.com/sekirodie1000/cot_faithfulness.git
+   cd sparse_coding
+   pip install -r requirements.txt
+   ```
 
+   > Note: The `requirements.txt` will install the original `automated-interpretability` repo as a dependency.
 
+2. **Manually replace the installed `automated-interpretability`**:
+
+   After installation, locate the installed `automated_interpretability/` package inside your Python environment (usually under `site-packages/`), and replace it with the version provided in this repository's `automated-interpretability/` folder.
+
+3. **Run experiments**:
+
+   Once dependencies are installed and the code is replaced, navigate to the `experiments/` directory and execute the relevant scripts.
