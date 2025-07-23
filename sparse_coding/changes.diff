@@ -1182,8 +1182,7 @@ index ac36d25..e94f75c 100644
  mypy==1.3.0
  mypy-extensions==1.0.0
  networkx==3.1
--neuron-explainer @ git+https://github.com/openai/automated-interpretability.git#subdirectory=neuron-explainer
-+neuron-explainer @ git+https://github.com/sekirodie1000/automated-interpretability.git#subdirectory=neuron-explainer
+ neuron-explainer @ git+https://github.com/openai/automated-interpretability.git#subdirectory=neuron-explainer
  numpy==1.24.3
  nvidia-cublas-cu11==11.10.3.66
  nvidia-cuda-cupti-cu11==11.7.101
